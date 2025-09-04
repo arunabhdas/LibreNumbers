@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 """
-resume_reformatter.py
 
-Reads an input .docx resume, detects section headings and bullet points,
+Reads an input .docx resume, detects section headings and bullet/numbered lists,
 and produces a neatly formatted resume .docx using python-docx.
+
+Fixes:
+- Removed use of private, non-existent run._r._add_fldChar API (which caused AttributeError).
+- Adds optional --template to start from a .docx that already contains page-number fields
+  in the footer/header. This is the recommended approach for dynamic page numbers with
+  python-docx (fields are not supported directly).
 
 Usage:
     pip install python-docx lxml
-    python resume_reformatter.py --in "/path/to/input.docx" --out "/path/to/output.docx"
-
-Notes:
-- Bullet detection relies first on the paragraph style (e.g., "List Bullet", "List Number")
-  and falls back to inspecting the underlying WordprocessingML (w:numPr) to tell if a
-  paragraph is in a list and whether it is bulleted vs numbered.
-- Section headings are inferred if the paragraph has a Heading style *or* matches common
-  resume section titles like "Profile", "Experience", "Projects", "Skills", "Education",
-  or "Certifications". Adjust SECTION_TITLES below to taste.
+    python resume_reformatter_v2.py --in "/path/to/input.docx" --out "/path/to/output.docx"
+    # Optional: use a template that already has PAGE/NUMPAGES fields in footer
+    python resume_reformatter_v2.py --in input.docx --out output.docx --template base_with_page_numbers.docx
 """
 
 import argparse
 import sys
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+
 
 SECTION_TITLES = {
     "profile",
@@ -41,8 +41,10 @@ SECTION_TITLES = {
     "awards",
 }
 
+
 def clean(text: str) -> str:
     return " ".join(text.split()).strip()
+
 
 def detect_list_type(paragraph) -> Optional[str]:
     """
@@ -105,20 +107,22 @@ def detect_list_type(paragraph) -> Optional[str]:
         # If anything goes sideways, assume bullet formatting
         return "bullet"
 
+
 def is_probable_heading(paragraph_text: str, paragraph_style_name: str) -> bool:
     txt = clean(paragraph_text).strip(":").lower()
     if not txt:
         return False
-    if paragraph_style_name.lower().startswith("heading"):
+    if (paragraph_style_name or "").lower().startswith("heading"):
         return True
     if txt in SECTION_TITLES:
         return True
-    # short, all-words-capped lines (e.g., "Experience") are often headings
-    if len(txt) <= 24 and txt.replace("&", " ").replace("/", " ").isalpha():
-        words = [w for w in paragraph_text.split() if w.isalpha()]
-        if words and all(w[0].isupper() for w in words):
+    # Short, Title-case lines are often headings (e.g., "Experience")
+    if len(txt) <= 32:
+        words = [w for w in paragraph_text.split() if any(c.isalpha() for c in w)]
+        if words and all(w[:1].isupper() for w in words):
             return True
     return False
+
 
 def read_source(input_path: str) -> List[Dict]:
     """Parse the input DOCX into a simple list of paragraph records."""
@@ -146,15 +150,10 @@ def read_source(input_path: str) -> List[Dict]:
         )
     return records
 
-def first_nonempty_text(records: List[Dict]) -> Optional[str]:
-    for r in records:
-        t = r["text"]
-        if t and not r["is_list"] and not r["is_heading"]:
-            return t
-    return None
 
-def build_output(records: List[Dict], output_path: str) -> None:
-    doc = Document()
+def build_output(records: List[Dict], output_path: str, template_path: Optional[str] = None) -> None:
+    # If a template is provided, start from it (recommended if it contains page-number fields)
+    doc = Document(template_path) if template_path else Document()
 
     # Page layout: compact professional margins
     for section in doc.sections:
@@ -168,7 +167,7 @@ def build_output(records: List[Dict], output_path: str) -> None:
     normal.name = "Calibri"
     normal.size = Pt(10.5)
 
-    # Optional title block (best-effort from first non-empty text)
+    # Optional title block (best-effort from first non-empty text if looks like a name)
     possible_name = records[0]["text"] if records else None
     if possible_name and len(possible_name.split()) <= 6:
         title = doc.add_paragraph()
@@ -178,11 +177,9 @@ def build_output(records: List[Dict], output_path: str) -> None:
         run.font.size = Pt(16)
 
     # Add body, grouping bullets under headings when found
-    current_section: Optional[str] = None
     for rec in records:
         text = rec["text"]
         if rec["is_heading"]:
-            current_section = text
             doc.add_heading(text, level=1)
             continue
 
@@ -194,23 +191,19 @@ def build_output(records: List[Dict], output_path: str) -> None:
             para = doc.add_paragraph(text)
             para.paragraph_format.space_after = Pt(6)
 
-    # Footer with page number
-    for section in doc.sections:
-        footer = section.footer
-        p = footer.paragraphs[0]
-        p.text = ""
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run()
-        fldChar1 = run._r._add_fldChar(fldCharType="begin")
-        instrText = run._r._add_instrText(" PAGE ")
-        fldChar2 = run._r._add_fldChar(fldCharType="end")
+    # IMPORTANT: No direct PAGE field insertion here, because python-docx doesn't expose a stable API
+    # for fields. If you want automatic page numbers, create a template that has a page-number field
+    # in the footer and pass it via --template. The field will remain intact and update in Word.
 
     doc.save(output_path)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Reformat a resume .docx with neat styles.")
     parser.add_argument("--in", dest="input_path", required=True, help="Path to input .docx resume")
     parser.add_argument("--out", dest="output_path", required=True, help="Path to write the formatted .docx")
+    parser.add_argument("--template", dest="template_path", required=False, default=None,
+                        help="Optional template .docx to start from (can contain footer page-number field)")
     args = parser.parse_args()
 
     records = read_source(args.input_path)
@@ -218,8 +211,9 @@ def main():
         print("No paragraphs found in the input document.", file=sys.stderr)
         sys.exit(2)
 
-    build_output(records, args.output_path)
+    build_output(records, args.output_path, template_path=args.template_path)
     print(f"✓ Wrote formatted resume to: {args.output_path}")
+
 
 if __name__ == "__main__":
     main()
