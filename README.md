@@ -1,5 +1,12 @@
 # LibreNumbers
 
+## Develop
+
+```
+source .venv/bin/activate
+
+uv pip install -r requirements.txt
+```
 
 ## Instantiating uv virtualenvironment
 
